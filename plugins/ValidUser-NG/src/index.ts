@@ -1,5 +1,5 @@
 import { findByProps, findByPropsAll, findByStoreName } from "@vendetta/metro";
-import { instead, after, before } from "@vendetta/patcher";
+import { instead, after } from "@vendetta/patcher";
 import { safeFetch } from "@vendetta/utils";
 import { storage } from "@vendetta/plugin";
 
@@ -18,12 +18,50 @@ const HTTP = findByProps("getAPIBaseURL") || findByProps("get", "post");
 const UserActions = findByProps("getUser", "fetchProfile") || findByProps("fetchProfile");
 const AuthToken = findByProps("getToken") || findByProps("token");
 
+// --- Fetch Queue & Concurrency (Equicord pattern) ---
+
+class FetchQueue {
+    private concurrency = 3;
+    private running = 0;
+    private queue: (() => Promise<void>)[] = [];
+
+    push(fn: () => Promise<void>) {
+        this.queue.push(fn);
+        this.next();
+    }
+
+    private next() {
+        if (this.running >= this.concurrency || this.queue.length === 0) return;
+        const fn = this.queue.shift();
+        if (!fn) return;
+
+        this.running++;
+        fn().finally(() => {
+            this.running--;
+            this.next();
+        });
+    }
+
+    clear() {
+        this.queue = [];
+        this.running = 0;
+    }
+}
+
+const queue = new FetchQueue();
+const inFlight = new Set<string>();
+const cooldowns = new Map<string, number>();
+const knownHints = new Map<string, string>();
+const deletedUsers = new Set<string>();
+let emitTimer: any = null;
+let unpatches: (() => void)[] = [];
+
 // --- User Models & Safety ---
 
 export function isRealUser(m: any): boolean {
     if (!m || typeof m !== "object" || !m.id) return false;
     if (m.isProvisional) return false;
-    const name = m.username || m.global_name || m.globalName;
+    const name = m.globalName || m.global_name || m.username;
     if (!name || typeof name !== "string") return false;
     const lower = name.toLowerCase().trim();
     return !(
@@ -66,7 +104,7 @@ export function ensureUserProto(u: any): any {
     if (typeof u.getAvatarSource !== "function") u.getAvatarSource = () => null;
     if (typeof u.hasAvatarDecoration !== "function") u.hasAvatarDecoration = () => false;
     if (typeof u.isVerifiedBot !== "function") u.isVerifiedBot = () => Boolean(u.bot);
-    if (typeof u.toString !== "function") u.toString = () => u.username || "User";
+    if (typeof u.toString !== "function") u.toString = () => u.globalName || u.global_name || u.username || "User";
 
     // Standard profile fields
     if (u.banner === undefined) u.banner = null;
@@ -74,6 +112,8 @@ export function ensureUserProto(u: any): any {
     if (u.accent_color === undefined) u.accent_color = null;
     if (u.bio === undefined) u.bio = "";
     if (u.flags === undefined) u.flags = 0;
+    if (u.publicFlags === undefined) u.publicFlags = 0;
+
     // Normalize display names between camelCase and snake_case
     if (!u.globalName && u.global_name) u.globalName = u.global_name;
     if (!u.global_name && u.globalName) u.global_name = u.globalName;
@@ -118,39 +158,7 @@ export function getUserDisplayName(userId: string, user?: any): string {
     return u?.username || "User";
 }
 
-export function createTombstoneUser(userId: string, hintName?: string): any {
-    const isProvisional = !hintName || hintName.toLowerCase() === "user" || /^\d+$/.test(hintName);
-    const name = (!hintName || /^\d+$/.test(hintName)) ? "User" : hintName;
-    const u = {
-        id: String(userId),
-        username: name,
-        discriminator: "0000",
-        avatar: null,
-        avatarDecoration: null,
-        bot: false,
-        system: false,
-        globalName: name,
-        global_name: name,
-        publicFlags: 0,
-        flags: 0,
-        banner: null,
-        accentColor: null,
-        bio: "",
-        guildMemberAvatars: {},
-        guild_member_avatars: {},
-        isProvisional,
-    };
-    return ensureUserProto(u);
-}
-
-// --- Storage & State ---
-
-const inFlight = new Set<string>();
-const cooldowns = new Map<string, number>();
-const knownHints = new Map<string, string>();
-const deletedUsers = new Set<string>();
-let emitTimer: any = null;
-let unpatches: (() => void)[] = [];
+// --- Storage & Hints ---
 
 function initStorage(): void {
     if (!storage.users || typeof storage.users !== "object") storage.users = {};
@@ -169,13 +177,23 @@ function initStorage(): void {
         deletedUsers.add(id);
     }
 
-    // Clean up any corrupted numerical hints from previous builds
     for (const id in storage.hints) {
         const val = storage.hints[id];
         if (!val || /^\d+$/.test(val) || val.toLowerCase() === "user") {
             delete storage.hints[id];
         } else {
             knownHints.set(id, val);
+        }
+    }
+}
+
+function restoreCachedUsers(): void {
+    if (!storage.users || typeof storage.users !== "object") return;
+    const now = Date.now();
+    for (const id in storage.users) {
+        const entry = storage.users[id];
+        if (entry?.user?.id && isRealUser(entry.user) && now - (entry.updatedAt || 0) < 86_400_000) {
+            publishUser(entry.user);
         }
     }
 }
@@ -210,19 +228,20 @@ function updateCachedMessageMentions(userId: string, displayName: string): void 
             const m = msgs[i];
             if (!m) continue;
 
-            // 1. Direct message content AST
+            // Direct message content AST
             if (Array.isArray(m.content)) {
                 for (let j = 0; j < m.content.length; j++) {
                     const node = m.content[j];
                     if (node && (node.type === "mention" || node.userId === userId || node.id === userId)) {
                         if (node.userId === userId || node.id === userId) {
+                            node.userId = userId;
                             node.content = [{ type: "text", content: "@" + displayName }];
                         }
                     }
                 }
             }
 
-            // 2. Embeds AST
+            // Embeds AST
             if (Array.isArray(m.embeds)) {
                 for (let e = 0; e < m.embeds.length; e++) {
                     const emb = m.embeds[e];
@@ -234,6 +253,7 @@ function updateCachedMessageMentions(userId: string, displayName: string): void 
                             for (let j = 0; j < val.length; j++) {
                                 const node = val[j];
                                 if (node && (node.userId === userId || node.id === userId)) {
+                                    node.userId = userId;
                                     node.content = [{ type: "text", content: "@" + displayName }];
                                 }
                             }
@@ -252,7 +272,7 @@ function triggerRerender(): void {
         try {
             MessageStore?.emitChange?.();
         } catch { }
-    }, 50);
+    }, 100);
 }
 
 function getAuthToken(): string | null {
@@ -267,32 +287,47 @@ function getAuthToken(): string | null {
     return null;
 }
 
-// --- Event-Driven Publisher & Fetcher ---
+// --- Event-Driven Publisher & Equicord-Style Fetcher ---
 
 function publishUser(user: any): void {
     if (!Dispatcher?.dispatch || !user?.id) return;
     try {
         Dispatcher.dispatch({ type: "USER_UPDATE", user: ensureUserProto(user) });
         Dispatcher.dispatch({ type: "USER_PROFILE_FETCH_FAILURE", userId: user.id });
-        triggerRerender();
     } catch { }
 }
 
-async function requestUser(userId: string): Promise<void> {
+function fetchUser(userId: string): void {
     if (!userId || inFlight.has(userId) || deletedUsers.has(userId)) return;
+
+    // Already loaded in UserStore
+    const live = UserStore?.getUser?.(userId);
+    if (live && isRealUser(live)) return;
+
+    // Already cached in storage (< 24h)
+    const cached = storage.users?.[userId]?.user;
+    if (cached && isRealUser(cached) && Date.now() - (storage.users[userId]?.updatedAt || 0) < 86_400_000) {
+        publishUser(cached);
+        return;
+    }
 
     const lastFail = cooldowns.get(userId);
     if (lastFail && Date.now() - lastFail < 60_000) return;
 
-    // Check storage cache (TTL 24h)
-    const cached = storage.users?.[userId];
-    if (cached?.user?.id && isRealUser(cached.user) && Date.now() - (cached.updatedAt || 0) < 86_400_000) {
-        publishUser(cached.user);
-        return;
-    }
-
     inFlight.add(userId);
 
+    queue.push(async () => {
+        try {
+            await doFetchUser(userId);
+        } finally {
+            inFlight.delete(userId);
+            // 150ms pacing between requests
+            await new Promise(r => setTimeout(r, 150));
+        }
+    });
+}
+
+async function doFetchUser(userId: string): Promise<void> {
     try {
         // 1. UserActions
         if (typeof UserActions?.getUser === "function") {
@@ -319,6 +354,11 @@ async function requestUser(userId: string): Promise<void> {
                 if (e?.status === 404 || e?.body?.code === 10013) {
                     markDeleted(userId);
                     return;
+                }
+                if (e?.status === 429) {
+                    const retry = (e?.body?.retry_after ?? 1) * 1000;
+                    await new Promise(r => setTimeout(r, retry));
+                    return doFetchUser(userId);
                 }
             }
 
@@ -356,8 +396,6 @@ async function requestUser(userId: string): Promise<void> {
         cooldowns.set(userId, Date.now());
     } catch {
         cooldowns.set(userId, Date.now());
-    } finally {
-        inFlight.delete(userId);
     }
 }
 
@@ -366,30 +404,80 @@ function saveUser(raw: any): void {
     if (!storage.users) storage.users = {};
     storage.users[user.id] = { user, updatedAt: Date.now() };
 
+    publishUser(user);
+
     const displayName = getUserDisplayName(user.id, user);
     if (displayName) {
         updateCachedMessageMentions(user.id, displayName);
     }
 
-    publishUser(user);
+    triggerRerender();
 }
 
 function markDeleted(userId: string): void {
     deletedUsers.add(userId);
     if (!storage.deleted) storage.deleted = {};
     storage.deleted[userId] = Date.now();
-
-    const hint = getHint(userId);
-    const tombstone = createTombstoneUser(userId, hint);
-    publishUser(tombstone);
 }
 
-// --- Event-Driven Hint Extractor (Universal Embed Scanner) ---
+// --- Message Scanner (Triggers fetch upon message load) ---
+
+function scanTextForMentions(text: string): void {
+    if (!text || typeof text !== "string") return;
+    const regex = /<@!?(\d{15,21})>/g;
+    let match: RegExpExecArray | null;
+    while ((match = regex.exec(text)) !== null) {
+        const id = match[1];
+        if (id) {
+            fetchUser(id);
+        }
+    }
+}
+
+function scanMessage(msg: any): void {
+    if (!msg) return;
+
+    if (typeof msg.content === "string") {
+        scanTextForMentions(msg.content);
+    }
+
+    if (Array.isArray(msg.embeds)) {
+        extractHintsFromEmbeds(msg.embeds);
+        for (let i = 0; i < msg.embeds.length; i++) {
+            const emb = msg.embeds[i];
+            if (!emb) continue;
+            if (typeof emb.title === "string") scanTextForMentions(emb.title);
+            if (typeof emb.description === "string") scanTextForMentions(emb.description);
+            if (typeof emb.rawDescription === "string") scanTextForMentions(emb.rawDescription);
+            if (Array.isArray(emb.fields)) {
+                for (let j = 0; j < emb.fields.length; j++) {
+                    const f = emb.fields[j];
+                    if (typeof f?.name === "string") scanTextForMentions(f.name);
+                    if (typeof f?.value === "string") scanTextForMentions(f.value);
+                }
+            }
+        }
+    }
+}
+
+function scanActiveChannel(): void {
+    try {
+        const channelId = SelectedChannelStore?.getChannelId?.();
+        if (!channelId) return;
+        const raw = MessageStore?.getMessages?.(channelId);
+        const msgs = Array.isArray(raw) ? raw : raw?._array || [];
+        for (let i = 0; i < msgs.length; i++) {
+            scanMessage(msgs[i]);
+        }
+    } catch { }
+}
+
+// --- Embed Hint Extractor ---
 
 function extractHintsFromEmbed(e: any): void {
     if (!e) return;
 
-    // 1. Author line join/leave hint: e.g. "username has joined the server"
+    // Author join/leave hint
     if (typeof e.author?.name === "string") {
         const m = e.author.name.match(/^(\S+)\s+(?:has\s+)?(?:joined|left|updated)/i);
         if (m) {
@@ -402,7 +490,6 @@ function extractHintsFromEmbed(e: any): void {
         }
     }
 
-    // 2. Collect ALL text blocks across descriptions and fields
     const blocks: string[] = [];
     if (typeof e.description === "string") blocks.push(e.description);
     if (typeof e.rawDescription === "string" && e.rawDescription !== e.description) blocks.push(e.rawDescription);
@@ -430,7 +517,6 @@ function extractHintsFromEmbed(e: any): void {
             const cleanLine = lines[l].replace(/[*~`>]/g, "").trim();
             if (!cleanLine) continue;
 
-            // Pattern: Name: _nebegemotik / Username: ... / User: ...
             const nameM = cleanLine.match(/^(?:Name|Username|User|Author):\s*(.+)$/i);
             if (nameM) {
                 const rawCandidate = nameM[1].replace(/[*~`]/g, "").trim();
@@ -440,19 +526,16 @@ function extractHintsFromEmbed(e: any): void {
                 }
             }
 
-            // Pattern: ID: 1053912510371201054 / User ID: ...
             const idM = cleanLine.match(/(?:ID|User ID):\s*(\d{15,21})/i);
             if (idM) {
                 foundId = idM[1];
             }
 
-            // Pattern: Mention: <@1053912510371201054> or just <@1053912510371201054>
             const mentionM = cleanLine.match(/<@!?(\d{15,21})>/);
             if (mentionM && !foundId) {
                 foundId = mentionM[1];
             }
 
-            // Pattern: Inline table: "username 1053912510371201054" (MUST start with a letter/underscore!)
             const inlineM = cleanLine.match(/^([a-zA-Z_][a-zA-Z0-9_.\-]*)\s*(?:[|(\[]\s*)?(\d{15,21})/);
             if (inlineM) {
                 const tName = inlineM[1].trim();
@@ -474,20 +557,6 @@ function extractHintsFromEmbeds(embeds: any[]): void {
     for (let i = 0; i < embeds.length; i++) {
         extractHintsFromEmbed(embeds[i]);
     }
-}
-
-function scanActiveChannelHints(): void {
-    try {
-        const channelId = SelectedChannelStore?.getChannelId?.();
-        if (!channelId) return;
-        const raw = MessageStore?.getMessages?.(channelId);
-        const msgs = Array.isArray(raw) ? raw : raw?._array || [];
-        for (let i = 0; i < msgs.length; i++) {
-            if (msgs[i]?.embeds) {
-                extractHintsFromEmbeds(msgs[i].embeds);
-            }
-        }
-    } catch { }
 }
 
 // --- Patches ---
@@ -535,22 +604,16 @@ function patchMarkdownRules(unpatches: (() => void)[]): void {
                                 res.userId = id;
                                 res.id = id;
 
-                                // Check if we already have the real resolved user
-                                const live = UserStore?.getUser?.(id);
-                                const cached = storage.users?.[id]?.user;
-                                const realUser = (live && isRealUser(live)) ? live : (cached && isRealUser(cached)) ? cached : null;
-
-                                if (realUser) {
-                                    // User is resolved: always format pill with their real name / server nickname!
+                                const realUser = UserStore?.getUser?.(id) || storage.users?.[id]?.user;
+                                if (realUser && isRealUser(realUser)) {
                                     const displayName = getUserDisplayName(id, realUser);
                                     if (displayName) {
                                         res.content = [{ type: "text", content: "@" + displayName }];
                                     }
                                 } else {
-                                    // User not yet resolved: trigger reactive fetch
-                                    requestUser(id);
+                                    // Trigger fetch upon parse if not already started
+                                    fetchUser(id);
 
-                                    // Display hint name in pill immediately if known
                                     const hint = getHint(id);
                                     if (hint) {
                                         res.content = [{ type: "text", content: "@" + hint }];
@@ -559,37 +622,6 @@ function patchMarkdownRules(unpatches: (() => void)[]): void {
                             }
                         } catch { }
                         return res;
-                    })
-                );
-            }
-
-            if (typeof rules.mention.react === "function") {
-                unpatches.push(
-                    before("react", rules.mention, (args) => {
-                        try {
-                            const [node] = args;
-                            if (!node) return;
-                            const id = node.userId || node.id;
-                            if (!id || !/^\d{15,21}$/.test(id)) return;
-
-                            const live = UserStore?.getUser?.(id);
-                            const cached = storage.users?.[id]?.user;
-                            const realUser = (live && isRealUser(live)) ? live : (cached && isRealUser(cached)) ? cached : null;
-
-                            if (realUser) {
-                                const displayName = getUserDisplayName(id, realUser);
-                                if (displayName) {
-                                    node.content = [{ type: "text", content: "@" + displayName }];
-                                }
-                            } else {
-                                const hint = getHint(id);
-                                if (hint) {
-                                    node.content = [{ type: "text", content: "@" + hint }];
-                                } else {
-                                    requestUser(id);
-                                }
-                            }
-                        } catch { }
                     })
                 );
             }
@@ -611,10 +643,6 @@ function patchUserStore(unpatches: (() => void)[]): void {
                     if (cached && isRealUser(cached)) {
                         return ensureUserProto(cached);
                     }
-
-                    // Return safe tombstone/shim so Profile Sheet and <UserMention> never crash!
-                    const hint = getHint(userId);
-                    return createTombstoneUser(userId, hint);
                 }
             } catch { }
             return res;
@@ -690,16 +718,24 @@ function patchAvatarSafety(unpatches: (() => void)[]): void {
 function patchFlux(unpatches: (() => void)[]): void {
     const handlePayload = (payload: any) => {
         try {
+            if (!payload) return;
+
+            // Batch messages (LOAD_MESSAGES_SUCCESS, LOCAL_MESSAGES_LOADED, etc.)
             if (Array.isArray(payload.messages)) {
                 for (let i = 0; i < payload.messages.length; i++) {
-                    const m = payload.messages[i];
-                    if (m?.embeds) extractHintsFromEmbeds(m.embeds);
+                    scanMessage(payload.messages[i]);
                 }
-            } else if (payload.message?.embeds) {
-                extractHintsFromEmbeds(payload.message.embeds);
-            } else if (payload.type === "CHANNEL_SELECT") {
-                scanActiveChannelHints();
-                setTimeout(scanActiveChannelHints, 300);
+            }
+
+            // Single message (MESSAGE_CREATE, MESSAGE_UPDATE)
+            if (payload.message) {
+                scanMessage(payload.message);
+            }
+
+            // Channel navigation
+            if (payload.type === "CHANNEL_SELECT") {
+                scanActiveChannel();
+                setTimeout(scanActiveChannel, 300);
             }
         } catch { }
     };
@@ -736,14 +772,15 @@ function patchFlux(unpatches: (() => void)[]): void {
 export default {
     onLoad() {
         initStorage();
+        restoreCachedUsers();
         patchAvatarSafety(unpatches);
         patchUserStore(unpatches);
         patchMarkdownRules(unpatches);
         patchFlux(unpatches);
 
-        // Scan current channel for any embed hints
-        scanActiveChannelHints();
-        setTimeout(scanActiveChannelHints, 300);
+        // Initial scan of active channel
+        scanActiveChannel();
+        setTimeout(scanActiveChannel, 300);
     },
 
     onUnload() {
@@ -752,6 +789,7 @@ export default {
         }
         unpatches = [];
 
+        queue.clear();
         inFlight.clear();
         cooldowns.clear();
         knownHints.clear();

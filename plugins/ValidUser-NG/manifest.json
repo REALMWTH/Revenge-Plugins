@@ -1,0 +1,14 @@
+{
+    "name": "ValidUser-NG",
+    "description": "Automatically resolves unknown user mentions like @unknown-user or <@userid> into valid, interactive mentions. (Restart Discord after enabling)",
+    "authors": [
+        {
+            "name": "realm_wth",
+            "id": "156443862204678144"
+        }
+    ],
+    "main": "src/index.ts",
+    "vendetta": {
+        "icon": "ic_mention_24px"
+    }
+}

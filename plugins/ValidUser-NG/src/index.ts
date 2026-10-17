@@ -57,19 +57,7 @@ let unpatches: (() => void)[] = [];
 // --- User Models & Safety ---
 
 export function isRealUser(m: any): boolean {
-    if (!m || typeof m !== "object" || !m.id) return false;
-    if (m.isProvisional) return false;
-    const name = m.globalName || m.global_name || m.username;
-    if (!name || typeof name !== "string") return false;
-    const lower = name.toLowerCase().trim();
-    return !(
-        lower === "user" ||
-        lower === "unknown-user" ||
-        lower === "unknown user" ||
-        lower === "invalid-user" ||
-        lower === "gitnex" ||
-        lower === "unknown"
-    );
+    return Boolean(m && typeof m === "object" && m.id && (m.username || m.globalName || m.global_name));
 }
 
 export function ensureUserProto(u: any): any {
@@ -83,7 +71,7 @@ export function ensureUserProto(u: any): any {
         } catch { }
     }
 
-    // Server-specific avatar protection
+    // Defensive guild avatars objects to prevent crash in native Hermes
     if (!u.guildMemberAvatars || typeof u.guildMemberAvatars !== "object") {
         u.guildMemberAvatars = {};
     }
@@ -91,58 +79,11 @@ export function ensureUserProto(u: any): any {
         u.guild_member_avatars = {};
     }
 
-    // Defensive methods to satisfy Discord's User model interface
-    if (typeof u.hasAvatarForGuild !== "function") u.hasAvatarForGuild = () => false;
-    if (typeof u.hasAnimatedAvatar !== "function") u.hasAnimatedAvatar = () => false;
-    if (typeof u.isSystemUser !== "function") u.isSystemUser = () => false;
-    if (typeof u.isStaff !== "function") u.isStaff = () => false;
-    if (typeof u.isClaimed !== "function") u.isClaimed = () => true;
-    if (typeof u.hasFlag !== "function") u.hasFlag = () => false;
-    if (typeof u.getAvatarURL !== "function") u.getAvatarURL = () => null;
-    if (typeof u.getAvatarSource !== "function") u.getAvatarSource = () => null;
-    if (typeof u.hasAvatarDecoration !== "function") u.hasAvatarDecoration = () => false;
-    if (typeof u.isVerifiedBot !== "function") u.isVerifiedBot = () => Boolean(u.bot);
-    if (typeof u.toString !== "function") u.toString = () => u.globalName || u.global_name || u.username || "User";
-
-    // Standard profile fields
-    if (u.banner === undefined) u.banner = null;
-    if (u.accentColor === undefined) u.accentColor = null;
-    if (u.accent_color === undefined) u.accent_color = null;
-    if (u.bio === undefined) u.bio = "";
-    if (u.flags === undefined) u.flags = 0;
-    if (u.publicFlags === undefined) u.publicFlags = 0;
-
     // Normalize display names between camelCase and snake_case
     if (!u.globalName && u.global_name) u.globalName = u.global_name;
     if (!u.global_name && u.globalName) u.global_name = u.globalName;
 
     return u;
-}
-
-export function createDeletedUser(userId: string): any {
-    const hex = BigInt(userId).toString(16);
-    const deletedName = `deleted_user_${hex}`;
-    const u = {
-        id: String(userId),
-        username: deletedName,
-        discriminator: "0000",
-        avatar: null,
-        avatarDecoration: null,
-        bot: false,
-        system: false,
-        globalName: deletedName,
-        global_name: deletedName,
-        publicFlags: 0,
-        flags: 0,
-        banner: null,
-        accentColor: 0xe6a836,
-        accent_color: 0xe6a836,
-        bio: "",
-        guildMemberAvatars: {},
-        guild_member_avatars: {},
-        isDeleted: true,
-    };
-    return ensureUserProto(u);
 }
 
 export function getUserDisplayName(userId: string, user?: any): string {
@@ -181,7 +122,6 @@ export function getUserDisplayName(userId: string, user?: any): string {
 // --- Storage & Cache ---
 
 function initStorage(): void {
-    // Purge legacy corrupted hints
     delete storage.hints;
     delete storage.deleted;
 
@@ -192,9 +132,7 @@ function initStorage(): void {
     const now = Date.now();
     for (const id in storage.users) {
         const item = storage.users[id];
-        const user = item?.user;
-        const name = user?.globalName || user?.global_name || user?.username;
-        if (!user?.id || !name || name.toLowerCase() === "gitnex" || name.toLowerCase() === "user" || now - (item.updatedAt || 0) > 86_400_000) {
+        if (!item?.user?.id || now - (item.updatedAt || 0) > 86_400_000) {
             delete storage.users[id];
         }
     }
@@ -331,7 +269,7 @@ async function doFetchUser(userId: string): Promise<void> {
             try {
                 await UserActions.getUser(userId);
                 const user = UserStore?.getUser?.(userId);
-                if (user?.id && isRealUser(user)) {
+                if (user?.id) {
                     saveUser(user);
                     return;
                 }
@@ -349,7 +287,7 @@ async function doFetchUser(userId: string): Promise<void> {
                 }
             } catch (e: any) {
                 if (e?.status === 404 || e?.body?.code === 10013) {
-                    saveDeletedUser(userId);
+                    cooldowns.set(userId, Date.now());
                     return;
                 }
                 if (e?.status === 429) {
@@ -368,7 +306,7 @@ async function doFetchUser(userId: string): Promise<void> {
                 }
             } catch (e: any) {
                 if (e?.status === 404 || e?.body?.code === 10013) {
-                    saveDeletedUser(userId);
+                    cooldowns.set(userId, Date.now());
                     return;
                 }
             }
@@ -385,9 +323,6 @@ async function doFetchUser(userId: string): Promise<void> {
                 saveUser(data);
                 return;
             }
-        } else if (resp.status === 404) {
-            saveDeletedUser(userId);
-            return;
         }
 
         cooldowns.set(userId, Date.now());
@@ -403,16 +338,6 @@ function saveUser(raw: any): void {
 
     publishUser(user);
     updateCachedMessageMentions(user.id);
-    triggerRerender();
-}
-
-function saveDeletedUser(userId: string): void {
-    const deletedUser = createDeletedUser(userId);
-    if (!storage.users) storage.users = {};
-    storage.users[userId] = { user: deletedUser, updatedAt: Date.now() };
-
-    publishUser(deletedUser);
-    updateCachedMessageMentions(userId);
     triggerRerender();
 }
 
@@ -513,15 +438,13 @@ function patchMarkdownRules(unpatches: (() => void)[]): void {
                                 res.id = id;
 
                                 const realUser = UserStore?.getUser?.(id) || storage.users?.[id]?.user;
-                                if (realUser && isRealUser(realUser)) {
+                                if (realUser) {
                                     const displayName = getUserDisplayName(id, realUser);
                                     if (displayName) {
                                         res.content = [{ type: "text", content: "@" + displayName }];
                                     }
                                 } else {
-                                    // Not in cache yet: show raw mention <@id> initially (matching Desktop behavior)
                                     res.content = [{ type: "text", content: `<@${id}>` }];
-                                    // Trigger immediate fetch
                                     fetchUser(id);
                                 }
                             }
@@ -540,12 +463,12 @@ function patchUserStore(unpatches: (() => void)[]): void {
     unpatches.push(
         after("getUser", UserStore, (args, res) => {
             try {
-                if (res && isRealUser(res)) return ensureUserProto(res);
+                if (res) return ensureUserProto(res);
 
                 const [userId] = args;
                 if (userId && typeof userId === "string" && /^\d{15,21}$/.test(userId)) {
                     const cached = storage.users?.[userId]?.user;
-                    if (cached && isRealUser(cached)) {
+                    if (cached) {
                         return ensureUserProto(cached);
                     }
                     fetchUser(userId);
@@ -557,7 +480,7 @@ function patchUserStore(unpatches: (() => void)[]): void {
 }
 
 function patchAvatarSafety(unpatches: (() => void)[]): void {
-    // 1. Safe default avatar URL fallback
+    // Safe default avatar URL fallback
     if (AvatarUtils?.getDefaultAvatarURL) {
         unpatches.push(
             instead("getDefaultAvatarURL", AvatarUtils, (args, orig) => {
@@ -574,7 +497,7 @@ function patchAvatarSafety(unpatches: (() => void)[]): void {
         );
     }
 
-    // 2. Defensive User.prototype.hasAvatarForGuild
+    // Defensive User.prototype.hasAvatarForGuild
     const currentUser = UserStore?.getCurrentUser?.();
     const userProto = currentUser ? Object.getPrototypeOf(currentUser) : null;
     if (userProto && typeof userProto.hasAvatarForGuild === "function") {
@@ -595,7 +518,7 @@ function patchAvatarSafety(unpatches: (() => void)[]): void {
         );
     }
 
-    // 3. Standalone Metro modules exporting hasAvatarForGuild
+    // Standalone Metro modules exporting hasAvatarForGuild
     const mods = findByPropsAll("hasAvatarForGuild") || [];
     for (let i = 0; i < mods.length; i++) {
         if (typeof mods[i]?.hasAvatarForGuild === "function") {

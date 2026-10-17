@@ -1,0 +1,15 @@
+{
+  "name": "ValidUser-NG",
+  "description": "Automatically resolves unknown user mentions like @unknown-user or <@userid> into valid, interactive mentions.",
+  "authors": [
+    {
+      "name": "realm_wth",
+      "id": "156443862204678144"
+    }
+  ],
+  "main": "index.js",
+  "vendetta": {
+    "icon": "ic_mention_24px"
+  },
+  "hash": "632d83c8b504f142ee9ffe220945f4318f4e24e98a774955ab7fbbaaeca30529"
+}

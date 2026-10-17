@@ -14,11 +14,63 @@ const GuildMemberStore = findByStoreName("GuildMemberStore") || findByProps("get
 const ChannelStore = findByStoreName("ChannelStore") || findByProps("getChannel", "getDMFromUserId");
 const RelationshipStore = findByStoreName("RelationshipStore") || findByProps("getNickname");
 const AvatarUtils = findByProps("getDefaultAvatarURL", "getUserAvatarURL");
-const HTTP = findByProps("getAPIBaseURL") || findByProps("get", "post");
-const UserActions = findByProps("getUser", "fetchProfile") || findByProps("fetchProfile");
-const AuthToken = findByProps("getToken") || findByProps("token");
+const UserActions = findByProps("getUser", "fetchProfile");
+const AuthenticationStore = findByStoreName("AuthenticationStore") || findByProps("getToken", "getId");
 
-// --- Fetch Queue & Concurrency ---
+// Robust RestAPI finder for Discord Metro (guarantees function get)
+function findRestAPI(): any {
+    const api = findByProps("get", "post", "del");
+    if (api && typeof api.get === "function") return api;
+
+    const all = findByPropsAll("get", "post") || [];
+    for (let i = 0; i < all.length; i++) {
+        const m = all[i];
+        if (m && typeof m.get === "function" && (typeof m.post === "function" || typeof m.put === "function" || typeof m.del === "function")) {
+            return m;
+        }
+    }
+
+    const api3 = findByProps("get", "put", "del");
+    if (api3 && typeof api3.get === "function") return api3;
+
+    return null;
+}
+
+const RestAPI = findRestAPI();
+
+function getAuthToken(): string | null {
+    try {
+        const t = AuthenticationStore?.getToken?.();
+        if (typeof t === "string" && t.length > 10) return t;
+    } catch { }
+    try {
+        const t = findByProps("getToken")?.getToken?.() || findByProps("token")?.token;
+        if (typeof t === "string" && t.length > 10) return t;
+    } catch { }
+    try {
+        const t = RestAPI?.defaults?.headers?.Authorization || RestAPI?.defaults?.headers?.common?.Authorization;
+        if (typeof t === "string" && t.length > 10) return t;
+    } catch { }
+    return null;
+}
+
+function debugLog(...args: any[]) {
+    try {
+        console.log("[ValidUser-NG]", ...args);
+        safeFetch("http://127.0.0.1:9090/log", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(args)
+        }).catch(() => { });
+        safeFetch("http://192.168.1.85:9090/log", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(args)
+        }).catch(() => { });
+    } catch { }
+}
+
+// --- Fetch Queue & Concurrency (Equicord pattern) ---
 
 class FetchQueue {
     private concurrency = 3;
@@ -90,7 +142,7 @@ export function getUserDisplayName(userId: string, user?: any): string {
     // 1. Friend custom nickname
     try {
         const friendNick = RelationshipStore?.getNickname?.(userId);
-        if (friendNick && typeof friendNick === "string") return friendNick;
+        if (friendNick) return friendNick;
     } catch { }
 
     // 2. Guild/Server member nickname
@@ -101,9 +153,7 @@ export function getUserDisplayName(userId: string, user?: any): string {
             const guildId = channel?.guild_id || channel?.guildId || SelectedGuildStore?.getGuildId?.();
             if (guildId) {
                 const member = GuildMemberStore?.getMember?.(guildId, userId);
-                if (member?.nick && typeof member.nick === "string") {
-                    return member.nick;
-                }
+                if (member?.nick) return member.nick;
             }
         }
     } catch { }
@@ -111,9 +161,9 @@ export function getUserDisplayName(userId: string, user?: any): string {
     // 3. User object: global display name (Pomelo) or username
     const u = user || UserStore?.getUser?.(userId) || storage.users?.[userId]?.user;
     if (u) {
-        if (typeof u.globalName === "string" && u.globalName) return u.globalName;
-        if (typeof u.global_name === "string" && u.global_name) return u.global_name;
-        if (typeof u.username === "string" && u.username) return u.username;
+        if (u.globalName) return u.globalName;
+        if (u.global_name) return u.global_name;
+        if (u.username) return u.username;
     }
 
     return `<@${userId}>`;
@@ -149,6 +199,19 @@ function restoreCachedUsers(): void {
     }
 }
 
+function nodeMatchesUserId(node: any, userId: string): boolean {
+    if (!node || typeof node !== "object") return false;
+    if (node.userId === userId || node.id === userId) return true;
+    if (typeof node.content === "string" && node.content.includes(userId)) return true;
+    if (Array.isArray(node.content)) {
+        for (let i = 0; i < node.content.length; i++) {
+            const child = node.content[i];
+            if (typeof child?.content === "string" && child.content.includes(userId)) return true;
+        }
+    }
+    return false;
+}
+
 function updateCachedMessageMentions(userId: string): void {
     try {
         const channelId = SelectedChannelStore?.getChannelId?.();
@@ -170,11 +233,14 @@ function updateCachedMessageMentions(userId: string): void {
             if (Array.isArray(m.content)) {
                 for (let j = 0; j < m.content.length; j++) {
                     const node = m.content[j];
-                    if (node && (node.userId === userId || node.id === userId)) {
+                    if (nodeMatchesUserId(node, userId)) {
                         node.userId = userId;
                         node.content = [{ type: "text", content: "@" + displayName }];
                     }
                 }
+            } else if (typeof m.content === "string" && m.content.includes(userId)) {
+                // If message content string contains raw mention, keep track
+                m._rawContent = m.content;
             }
 
             // Embeds AST
@@ -188,7 +254,7 @@ function updateCachedMessageMentions(userId: string): void {
                         if (Array.isArray(val)) {
                             for (let j = 0; j < val.length; j++) {
                                 const node = val[j];
-                                if (node && (node.userId === userId || node.id === userId)) {
+                                if (nodeMatchesUserId(node, userId)) {
                                     node.userId = userId;
                                     node.content = [{ type: "text", content: "@" + displayName }];
                                 }
@@ -211,19 +277,7 @@ function triggerRerender(): void {
     }, 100);
 }
 
-function getAuthToken(): string | null {
-    try {
-        const t = AuthToken?.getToken?.() || AuthToken?.token;
-        if (typeof t === "string" && t.length > 10) return t;
-    } catch { }
-    try {
-        const t = HTTP?.defaults?.headers?.common?.Authorization;
-        if (typeof t === "string" && t.length > 10) return t;
-    } catch { }
-    return null;
-}
-
-// --- Fetcher & Publisher ---
+// --- Equicord-Style Fetcher & Publisher ---
 
 function publishUser(user: any): void {
     if (!Dispatcher?.dispatch || !user?.id) return;
@@ -236,7 +290,7 @@ function publishUser(user: any): void {
 function fetchUser(userId: string): void {
     if (!userId || inFlight.has(userId)) return;
 
-    // Already loaded in UserStore
+    // Already in UserStore
     const live = UserStore?.getUser?.(userId);
     if (live && isRealUser(live)) return;
 
@@ -248,13 +302,16 @@ function fetchUser(userId: string): void {
     }
 
     const lastFail = cooldowns.get(userId);
-    if (lastFail && Date.now() - lastFail < 60_000) return;
+    if (lastFail && Date.now() - lastFail < 30_000) return;
 
     inFlight.add(userId);
 
     queue.push(async () => {
         try {
+            debugLog(`[FETCH] Requesting user ${userId} from Discord API`);
             await doFetchUser(userId);
+        } catch (e: any) {
+            debugLog(`[FETCH_ERR] Error requesting ${userId}:`, e?.message || e);
         } finally {
             inFlight.delete(userId);
             await new Promise(r => setTimeout(r, 150));
@@ -263,70 +320,63 @@ function fetchUser(userId: string): void {
 }
 
 async function doFetchUser(userId: string): Promise<void> {
-    try {
-        // 1. UserActions
-        if (typeof UserActions?.getUser === "function") {
+    let body: any = null;
+
+    // 1. Equicord Pattern: Call Discord's internal RestAPI.get
+    const api = findRestAPI();
+    if (api && typeof api.get === "function") {
+        try {
+            const res = await api.get({ url: `/users/${userId}` });
+            body = res?.body || res;
+        } catch (e: any) {
+            if (e?.status === 404) {
+                debugLog(`[404] User ${userId} not found`);
+                cooldowns.set(userId, Date.now());
+                return;
+            }
+            if (e?.status === 429) {
+                const retry = (e?.body?.retry_after ?? 1) * 1000;
+                await new Promise(r => setTimeout(r, retry));
+                return doFetchUser(userId);
+            }
             try {
-                await UserActions.getUser(userId);
-                const user = UserStore?.getUser?.(userId);
-                if (user?.id) {
-                    saveUser(user);
-                    return;
-                }
+                const res = await api.get(`/users/${userId}`);
+                body = res?.body || res;
             } catch { }
         }
+    }
 
-        // 2. Discord internal HTTP client
-        if (typeof HTTP?.get === "function") {
-            try {
-                const res = await HTTP.get({ url: `/users/${userId}` });
-                const raw = res?.body || res;
-                if (raw?.id) {
-                    saveUser(raw);
-                    return;
-                }
-            } catch (e: any) {
-                if (e?.status === 404 || e?.body?.code === 10013) {
-                    cooldowns.set(userId, Date.now());
-                    return;
-                }
-                if (e?.status === 429) {
-                    const retry = (e?.body?.retry_after ?? 1) * 1000;
-                    await new Promise(r => setTimeout(r, retry));
-                    return doFetchUser(userId);
-                }
+    // 2. Discord's Native UserActions.getUser
+    if (!body?.id && typeof UserActions?.getUser === "function") {
+        try {
+            await UserActions.getUser(userId);
+            const user = UserStore?.getUser?.(userId);
+            if (user?.id) {
+                saveUser(user);
+                return;
             }
+        } catch { }
+    }
 
-            try {
-                const res = await HTTP.get(`/users/${userId}`);
-                const raw = res?.body || res;
-                if (raw?.id) {
-                    saveUser(raw);
-                    return;
-                }
-            } catch (e: any) {
-                if (e?.status === 404 || e?.body?.code === 10013) {
-                    cooldowns.set(userId, Date.now());
-                    return;
-                }
-            }
-        }
-
-        // 3. Fallback safeFetch with auth token
+    // 3. Fallback safeFetch with auth token
+    if (!body?.id) {
         const token = getAuthToken();
         const headers: Record<string, string> = { "Content-Type": "application/json" };
         if (token) headers["Authorization"] = token;
         const resp = await safeFetch(`https://discord.com/api/v9/users/${userId}`, { headers });
         if (resp.status === 200) {
-            const data = await resp.json();
-            if (data?.id) {
-                saveUser(data);
-                return;
-            }
+            body = await resp.json();
+        } else if (resp.status === 404) {
+            debugLog(`[404] User ${userId} not found via safeFetch`);
+            cooldowns.set(userId, Date.now());
+            return;
         }
+    }
 
-        cooldowns.set(userId, Date.now());
-    } catch {
+    if (body?.id) {
+        debugLog(`[SUCCESS] Resolved user ${userId}:`, body.username, body.global_name || body.globalName);
+        saveUser(body);
+    } else {
         cooldowns.set(userId, Date.now());
     }
 }
@@ -341,7 +391,7 @@ function saveUser(raw: any): void {
     triggerRerender();
 }
 
-// --- Message Scanner (Extracts IDs & Triggers API Fetch) ---
+// --- Message Scanner (Extracts IDs & Triggers API Fetch upon message load) ---
 
 function scanTextForMentions(text: string): void {
     if (!text || typeof text !== "string") return;
@@ -444,7 +494,6 @@ function patchMarkdownRules(unpatches: (() => void)[]): void {
                                         res.content = [{ type: "text", content: "@" + displayName }];
                                     }
                                 } else {
-                                    res.content = [{ type: "text", content: `<@${id}>` }];
                                     fetchUser(id);
                                 }
                             }
@@ -480,7 +529,6 @@ function patchUserStore(unpatches: (() => void)[]): void {
 }
 
 function patchAvatarSafety(unpatches: (() => void)[]): void {
-    // Safe default avatar URL fallback
     if (AvatarUtils?.getDefaultAvatarURL) {
         unpatches.push(
             instead("getDefaultAvatarURL", AvatarUtils, (args, orig) => {
@@ -497,7 +545,6 @@ function patchAvatarSafety(unpatches: (() => void)[]): void {
         );
     }
 
-    // Defensive User.prototype.hasAvatarForGuild
     const currentUser = UserStore?.getCurrentUser?.();
     const userProto = currentUser ? Object.getPrototypeOf(currentUser) : null;
     if (userProto && typeof userProto.hasAvatarForGuild === "function") {
@@ -518,7 +565,6 @@ function patchAvatarSafety(unpatches: (() => void)[]): void {
         );
     }
 
-    // Standalone Metro modules exporting hasAvatarForGuild
     const mods = findByPropsAll("hasAvatarForGuild") || [];
     for (let i = 0; i < mods.length; i++) {
         if (typeof mods[i]?.hasAvatarForGuild === "function") {
@@ -549,16 +595,27 @@ function patchFlux(unpatches: (() => void)[]): void {
         try {
             if (!payload) return;
 
-            // Batch messages (LOAD_MESSAGES_SUCCESS, LOCAL_MESSAGES_LOADED, etc.)
+            // Batch messages
             if (Array.isArray(payload.messages)) {
                 for (let i = 0; i < payload.messages.length; i++) {
                     scanMessage(payload.messages[i]);
                 }
             }
 
-            // Single message (MESSAGE_CREATE, MESSAGE_UPDATE)
+            // Single message
             if (payload.message) {
                 scanMessage(payload.message);
+            }
+
+            // Real-time user update in Flux
+            if (payload.type === "USER_UPDATE" && payload.user?.id) {
+                const u = payload.user;
+                if (isRealUser(u)) {
+                    if (!storage.users) storage.users = {};
+                    storage.users[u.id] = { user: ensureUserProto(u), updatedAt: Date.now() };
+                    updateCachedMessageMentions(u.id);
+                    triggerRerender();
+                }
             }
 
             // Channel navigation
@@ -577,6 +634,7 @@ function patchFlux(unpatches: (() => void)[]): void {
             "LOAD_MESSAGES_AROUND_SUCCESS",
             "LOCAL_MESSAGES_LOADED",
             "CHANNEL_SELECT",
+            "USER_UPDATE",
         ];
         for (let i = 0; i < events.length; i++) {
             const ev = events[i];
@@ -610,6 +668,8 @@ export default {
         // Initial scan of active channel
         scanActiveChannel();
         setTimeout(scanActiveChannel, 300);
+
+        debugLog("ValidUser-NG loaded. RestAPI available:", Boolean(findRestAPI()?.get));
     },
 
     onUnload() {

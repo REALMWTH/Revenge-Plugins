@@ -1,6 +1,6 @@
 {
   "name": "ValidUser-NG",
-  "description": "Automatically resolves unknown user mentions like @unknown-user or <@userid> into valid, interactive mentions.",
+  "description": "Automatically resolves unknown user mentions like @unknown-user or <@userid> into valid, interactive mentions. (Restart Discord after enabling)",
   "authors": [
     {
       "name": "realm_wth",
@@ -11,5 +11,5 @@
   "vendetta": {
     "icon": "ic_mention_24px"
   },
-  "hash": "9e0da2ac2700439cad6a04625b898d0c5411fccac3b8d37cbf88a915a6783e6e"
+  "hash": "ffc6262e96f7a9ff716e79a5ceac1dd4319c63470b81d069e2f40d02bd14400d"
 }
